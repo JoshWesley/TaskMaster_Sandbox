@@ -244,12 +244,12 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
                 count += 1
                 elapsed = time.time() - start_time
                 rate = count / elapsed if elapsed > 0 else 0
-                if outlook_count and outlook_count > count:
-                    # Show progress bar when we have a reliable total
-                    _print_progress(count, outlook_count, folder_name, start_time)
-                else:
-                    sys.stdout.write(f"\r  ⏳ {count:,} emails synced | {folder_name} | {rate:.0f}/sec  ")
-                    sys.stdout.flush()
+                eta_str = ""
+                if limit_per_folder and limit_per_folder > count:
+                    eta = (limit_per_folder - count) / rate if rate > 0 else 0
+                    eta_str = f" | ETA: {eta:.0f}s"
+                sys.stdout.write(f"\r  ⏳ {count:,} emails synced | {folder_name} | {rate:.0f}/sec{eta_str}     ")
+                sys.stdout.flush()
 
             # End of folder
             elapsed = time.time() - start_time
