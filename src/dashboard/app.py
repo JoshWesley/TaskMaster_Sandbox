@@ -149,11 +149,12 @@ def _get_last_sync_time(db: DatabaseManager, folder_name: str) -> str | None:
         return None
 
 
-def _sync_outlook(limit_per_folder: int = 500, force_full: bool = False) -> dict[str, Any]:
+def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False) -> dict[str, Any]:
     """Connect to Outlook, extract emails with progress bar, and return a status report.
 
     Uses incremental sync on subsequent runs — only fetches emails newer than
     the last sync time. Data is persisted to SQLite for fast future startups.
+    Set limit_per_folder to cap emails per folder (None = sync all).
     """
 
     db = DatabaseManager(DB_PATH)
@@ -199,11 +200,22 @@ def _sync_outlook(limit_per_folder: int = 500, force_full: bool = False) -> dict
             if last_sync:
                 print(f"\n  📂 {folder_name} (incremental since {last_sync})")
             else:
-                print(f"\n  📂 {folder_name} (full sync, up to {limit_per_folder} emails)")
+                label = f"up to {limit_per_folder}" if limit_per_folder else "all emails"
+                print(f"\n  📂 {folder_name} (full sync, {label})")
 
             start_time = time.time()
             count = 0
             folder_records = []
+
+            # Get total count for progress bar when doing full sync
+            folder_total = limit_per_folder  # Use as estimate if set
+            if not limit_per_folder:
+                try:
+                    namespace = extractor.connect()
+                    folder_obj = namespace.Folders.Item(1).Folders[folder_name]
+                    folder_total = folder_obj.Items.Count
+                except Exception:
+                    folder_total = 0  # Unknown — progress will show count only
 
             for item in extractor.iter_folder_items(folder_name, limit=limit_per_folder):
                 record = extractor.extract_message(item, folder_name)
@@ -216,7 +228,14 @@ def _sync_outlook(limit_per_folder: int = 500, force_full: bool = False) -> dict
 
                 folder_records.append(record)
                 count += 1
-                _print_progress(count, limit_per_folder, folder_name, start_time)
+                if folder_total and folder_total > 0:
+                    _print_progress(count, folder_total, folder_name, start_time)
+                else:
+                    # Unknown total — just show count and rate
+                    elapsed = time.time() - start_time
+                    rate = count / elapsed if elapsed > 0 else 0
+                    sys.stdout.write(f"\r  ⏳ {count} emails synced | {folder_name} | {rate:.0f}/sec  ")
+                    sys.stdout.flush()
 
             # End of folder
             elapsed = time.time() - start_time
@@ -279,7 +298,7 @@ def _sync_outlook(limit_per_folder: int = 500, force_full: bool = False) -> dict
     return report
 
 
-def create_app(sync_limit: int = 500) -> "Dash":
+def create_app(sync_limit: int | None = None) -> "Dash":
     """Create the Dash app with live Outlook data."""
 
     if Dash is None:
@@ -518,7 +537,7 @@ if __name__ == "__main__":  # pragma: no cover
     print("  📬 Outlook Intelligence Dashboard")
     print("=" * 60)
     print("\n  Syncing with Outlook...\n")
-    app = create_app(sync_limit=500)
+    app = create_app()
     print("\n" + "=" * 60)
     print("  🚀 Dashboard ready at http://127.0.0.1:8050")
     print("=" * 60 + "\n")
