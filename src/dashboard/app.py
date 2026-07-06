@@ -197,8 +197,30 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
         for folder_name in folders:
             last_sync = _get_last_sync_time(db, folder_name) if has_cache and not force_full else None
 
+            # Check if previous sync was incomplete (e.g. was limited)
+            # Compare DB count vs actual Outlook folder count
+            needs_full_sync = False
+            try:
+                namespace = extractor.connect()
+                folder_obj = namespace.Folders.Item(1).Folders[folder_name]
+                outlook_count = folder_obj.Items.Count
+            except Exception:
+                outlook_count = 0
+
+            if last_sync and outlook_count > 0:
+                with db.connect() as conn:
+                    db_count = conn.execute(
+                        "SELECT COUNT(*) FROM emails WHERE folder = ?", (folder_name,)
+                    ).fetchone()[0]
+                # If DB has significantly fewer emails than Outlook, do a full sync
+                if db_count < outlook_count * 0.9:
+                    needs_full_sync = True
+                    last_sync = None  # Force full sync for this folder
+
             if last_sync:
                 print(f"\n  📂 {folder_name} (incremental since {last_sync})")
+            elif needs_full_sync:
+                print(f"\n  📂 {folder_name} (full sync — previous sync was incomplete, {outlook_count} emails in folder)")
             else:
                 label = f"up to {limit_per_folder}" if limit_per_folder else "all emails"
                 print(f"\n  📂 {folder_name} (full sync, {label})")
@@ -207,15 +229,8 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
             count = 0
             folder_records = []
 
-            # Get total count for progress bar when doing full sync
-            folder_total = limit_per_folder  # Use as estimate if set
-            if not limit_per_folder:
-                try:
-                    namespace = extractor.connect()
-                    folder_obj = namespace.Folders.Item(1).Folders[folder_name]
-                    folder_total = folder_obj.Items.Count
-                except Exception:
-                    folder_total = 0  # Unknown — progress will show count only
+            # Get total count for progress bar
+            folder_total = limit_per_folder or outlook_count
 
             for item in extractor.iter_folder_items(folder_name, limit=limit_per_folder):
                 record = extractor.extract_message(item, folder_name)
