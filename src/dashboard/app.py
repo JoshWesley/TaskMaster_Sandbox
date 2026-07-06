@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from dash import Dash, Input, Output, dash_table, dcc, html
+    from dash import Dash, Input, Output, State, callback_context, dash_table, dcc, html, no_update
 except ImportError:  # pragma: no cover
     Dash = None  # type: ignore[assignment]
-    Input = Output = dash_table = dcc = html = None  # type: ignore[assignment]
+    Input = Output = State = callback_context = dash_table = dcc = html = no_update = None  # type: ignore[assignment]
 
 # Ensure src is importable when running this file directly.
 _SRC_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -298,6 +298,137 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
     return report
 
 
+def _metric_card_id(title: str) -> str:
+    slug = "".join(char.lower() if char.isalnum() else "-" for char in title)
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return f"metric-{slug.strip('-')}"
+
+
+def _metric_filters() -> dict[str, dict[str, Any]]:
+    return {
+        _metric_card_id("Total Emails Synced"): {"kind": "all", "value": None, "label": "All Conversations"},
+        _metric_card_id("Conversations"): {"kind": "all", "value": None, "label": "All Conversations"},
+        _metric_card_id("Folders Synced"): {"kind": "all", "value": None, "label": "All Conversations"},
+        _metric_card_id("Unread"): {"kind": "has_unread", "value": True, "label": "Unread"},
+        _metric_card_id("Flagged"): {"kind": "has_flagged", "value": True, "label": "Flagged"},
+        _metric_card_id("Awaiting My Action"): {
+            "kind": "ownership",
+            "value": "Awaiting My Action",
+            "label": "Awaiting My Action",
+        },
+        _metric_card_id("Waiting For Others"): {
+            "kind": "ownership",
+            "value": "Waiting For Others",
+            "label": "Waiting For Others",
+        },
+        _metric_card_id("Information Only"): {
+            "kind": "ownership",
+            "value": "Information Only",
+            "label": "Information Only",
+        },
+        _metric_card_id("Unknown"): {"kind": "ownership", "value": "Unknown", "label": "Unknown Ownership"},
+        _metric_card_id("Internal"): {"kind": "type", "value": "Internal", "label": "Internal"},
+        _metric_card_id("External"): {"kind": "type", "value": "External", "label": "External"},
+        _metric_card_id("Mixed"): {"kind": "type", "value": "Mixed", "label": "Mixed"},
+    }
+
+
+def _load_conversation_flags() -> dict[str, dict[str, bool]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                conversation_id,
+                MAX(CASE WHEN read_status = 'Unread' THEN 1 ELSE 0 END) AS has_unread,
+                MAX(
+                    CASE
+                        WHEN flag_status NOT IN ('0', '', 'None') AND flag_status IS NOT NULL THEN 1
+                        ELSE 0
+                    END
+                ) AS has_flagged
+            FROM emails
+            GROUP BY conversation_id
+            """
+        ).fetchall()
+    return {
+        str(row["conversation_id"]): {
+            "has_unread": bool(row["has_unread"]),
+            "has_flagged": bool(row["has_flagged"]),
+        }
+        for row in rows
+    }
+
+
+def _filter_conversations(conversations: list[dict[str, Any]], filter_state: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not filter_state or filter_state.get("kind") == "all":
+        return conversations
+
+    kind = str(filter_state.get("kind") or "")
+    value = filter_state.get("value")
+    if kind == "ownership":
+        return [conversation for conversation in conversations if conversation.get("ownership") == value]
+    if kind == "type":
+        return [conversation for conversation in conversations if conversation.get("type") == value]
+    if kind in {"has_unread", "has_flagged"}:
+        return [conversation for conversation in conversations if bool(conversation.get(kind)) == bool(value)]
+    return conversations
+
+
+def _load_conversation_detail(conversation_id: str) -> dict[str, Any] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        conversation = conn.execute(
+            """
+            SELECT conversation_id, topic, participants, latest_sender, last_activity
+            FROM conversations
+            WHERE conversation_id = ?
+            """,
+            (conversation_id,),
+        ).fetchone()
+        if conversation is None:
+            return None
+
+        emails = conn.execute(
+            """
+            SELECT entry_id, subject, sender_name, received_time, read_status, body_preview
+            FROM emails
+            WHERE conversation_id = ?
+            ORDER BY received_time DESC, sent_time DESC, rowid DESC
+            """,
+            (conversation_id,),
+        ).fetchall()
+
+    email_rows = [dict(row) for row in emails]
+    participants = [
+        participant.strip()
+        for participant in str(conversation["participants"] or "").split(",")
+        if participant.strip()
+    ]
+    latest_email = email_rows[0] if email_rows else {}
+    return {
+        "conversation_id": str(conversation["conversation_id"]),
+        "topic": str(conversation["topic"] or "Untitled Conversation"),
+        "participants": participants,
+        "latest_sender": str(conversation["latest_sender"] or ""),
+        "last_activity": str(conversation["last_activity"] or ""),
+        "emails": email_rows,
+        "latest_email": latest_email,
+    }
+
+
+def _open_email_in_outlook(entry_id: str) -> tuple[bool, str]:
+    try:
+        import win32com.client  # type: ignore[import-not-found]
+
+        namespace = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        namespace.GetItemFromID(entry_id).Display()
+        return True, "Opened email in Outlook."
+    except Exception as exc:  # pragma: no cover
+        return False, f"Could not open Outlook email: {exc}"
+
+
 def create_app(sync_limit: int | None = None) -> "Dash":
     """Create the Dash app with live Outlook data."""
 
@@ -307,19 +438,174 @@ def create_app(sync_limit: int | None = None) -> "Dash":
     # Sync data from Outlook (incremental if cache exists)
     report = _sync_outlook(limit_per_folder=sync_limit)
 
-    app = Dash(__name__)
+    app = Dash(__name__, suppress_callback_exceptions=True)
     app.layout = _build_layout(report)
 
-    # Callback: filter conversations table by ownership
     @app.callback(
         Output("conversations-table", "data"),
-        Input("ownership-filter", "value"),
+        Output("conversations-table", "active_cell"),
+        Output("active-filter-label", "children"),
+        Output("clear-filter-button", "disabled"),
+        Input("metric-filter-store", "data"),
         Input("conversations-store", "data"),
     )
-    def filter_conversations(ownership: str, conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if ownership == "All":
-            return conversations
-        return [c for c in conversations if c.get("ownership") == ownership]
+    def filter_conversations(
+        filter_state: dict[str, Any] | None,
+        conversations: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], None, str, bool]:
+        all_conversations = conversations or []
+        applied_filter = filter_state or {"kind": "all", "value": None, "label": "All Conversations"}
+        filtered = _filter_conversations(all_conversations, applied_filter)
+        label = f"Active Filter: {applied_filter.get('label', 'All Conversations')} ({len(filtered)} conversations)"
+        return filtered, None, label, applied_filter.get("kind") == "all"
+
+    @app.callback(
+        Output("metric-filter-store", "data"),
+        Input(_metric_card_id("Total Emails Synced"), "n_clicks"),
+        Input(_metric_card_id("Conversations"), "n_clicks"),
+        Input(_metric_card_id("Folders Synced"), "n_clicks"),
+        Input(_metric_card_id("Unread"), "n_clicks"),
+        Input(_metric_card_id("Flagged"), "n_clicks"),
+        Input(_metric_card_id("Awaiting My Action"), "n_clicks"),
+        Input(_metric_card_id("Waiting For Others"), "n_clicks"),
+        Input(_metric_card_id("Information Only"), "n_clicks"),
+        Input(_metric_card_id("Unknown"), "n_clicks"),
+        Input(_metric_card_id("Internal"), "n_clicks"),
+        Input(_metric_card_id("External"), "n_clicks"),
+        Input(_metric_card_id("Mixed"), "n_clicks"),
+        Input("clear-filter-button", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def update_metric_filter(*_: Any) -> dict[str, Any] | Any:
+        triggered = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else ""
+        if not triggered:
+            return no_update
+        if triggered == "clear-filter-button":
+            return {"kind": "all", "value": None, "label": "All Conversations"}
+        return _metric_filters().get(triggered, no_update)
+
+    @app.callback(
+        Output("conversation-detail-panel", "children"),
+        Output("selected-entry-store", "data"),
+        Input("conversations-table", "active_cell"),
+        Input("conversations-table", "derived_virtual_data"),
+        State("conversations-table", "data"),
+    )
+    def show_conversation_detail(
+        active_cell: dict[str, Any] | None,
+        visible_rows: list[dict[str, Any]] | None,
+        all_rows: list[dict[str, Any]] | None,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        rows = visible_rows or all_rows or []
+        if not active_cell or active_cell.get("row") is None or active_cell["row"] >= len(rows):
+            return (
+                html.Div(
+                    "Select a conversation row to see thread details and open the latest email in Outlook.",
+                    style={"padding": "16px", "color": "#666"},
+                ),
+                None,
+            )
+
+        conversation_id = str(rows[active_cell["row"]].get("conversation_id") or "")
+        if not conversation_id:
+            return no_update, no_update
+
+        detail = _load_conversation_detail(conversation_id)
+        if detail is None:
+            return html.Div("Conversation details are unavailable.", style={"padding": "16px", "color": "#c62828"}), None
+
+        email_rows = [
+            {
+                "subject": email.get("subject") or "(No subject)",
+                "sender": email.get("sender_name") or "",
+                "date": email.get("received_time") or "",
+                "read_status": email.get("read_status") or "",
+            }
+            for email in detail["emails"]
+        ]
+        latest_email = detail["latest_email"]
+        body_preview = str(latest_email.get("body_preview") or "No preview available.")
+        selected_entry = str(latest_email.get("entry_id") or "")
+
+        panel = html.Div(
+            [
+                html.H3("Conversation Detail", style={"marginTop": "0"}),
+                html.Div([html.Strong("Topic: "), html.Span(detail["topic"])]),
+                html.Div(
+                    [
+                        html.Strong("Participants: "),
+                        html.Span(", ".join(detail["participants"]) if detail["participants"] else "No participants found"),
+                    ],
+                    style={"marginTop": "8px"},
+                ),
+                html.H4("Emails", style={"marginTop": "16px"}),
+                dash_table.DataTable(
+                    columns=[
+                        {"name": "Subject", "id": "subject"},
+                        {"name": "Sender", "id": "sender"},
+                        {"name": "Date", "id": "date"},
+                        {"name": "Read Status", "id": "read_status"},
+                    ],
+                    data=email_rows,
+                    page_size=10,
+                    style_table={"overflowX": "auto"},
+                    style_cell={"textAlign": "left", "padding": "8px", "maxWidth": "300px", "whiteSpace": "normal"},
+                    style_header={"fontWeight": "bold", "backgroundColor": "#f5f5f5"},
+                ),
+                html.H4("Latest Email Preview", style={"marginTop": "16px"}),
+                html.Div(
+                    body_preview,
+                    style={
+                        "backgroundColor": "#fafafa",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "8px",
+                        "padding": "12px",
+                        "whiteSpace": "pre-wrap",
+                    },
+                ),
+                html.Button(
+                    "Open Latest Email in Outlook",
+                    id="open-email-button",
+                    n_clicks=0,
+                    disabled=not selected_entry,
+                    style={
+                        "marginTop": "16px",
+                        "padding": "10px 16px",
+                        "border": "none",
+                        "borderRadius": "8px",
+                        "backgroundColor": "#1976d2",
+                        "color": "white",
+                        "cursor": "pointer",
+                        "fontWeight": "bold",
+                    },
+                ),
+                html.Div(id="outlook-open-status", style={"marginTop": "12px"}),
+            ],
+            style={
+                "marginTop": "20px",
+                "padding": "20px",
+                "border": "1px solid #e0e0e0",
+                "borderRadius": "10px",
+                "backgroundColor": "white",
+                "boxShadow": "0 2px 6px rgba(0, 0, 0, 0.06)",
+            },
+        )
+        return panel, {"entry_id": selected_entry}
+
+    @app.callback(
+        Output("outlook-open-status", "children"),
+        Input("open-email-button", "n_clicks"),
+        State("selected-entry-store", "data"),
+        prevent_initial_call=True,
+    )
+    def open_selected_email(n_clicks: int, selected_entry: dict[str, Any] | None) -> Any:
+        if not n_clicks:
+            return no_update
+        entry_id = str((selected_entry or {}).get("entry_id") or "")
+        if not entry_id:
+            return html.Span("No email selected to open.", style={"color": "#c62828"})
+        opened, message = _open_email_in_outlook(entry_id)
+        return html.Span(message, style={"color": "#2e7d32" if opened else "#c62828"})
 
     return app
 
@@ -350,6 +636,30 @@ def _build_layout(report: dict[str, Any]) -> Any:
             ],
             style={"padding": "12px 16px", "backgroundColor": "#ffebee", "borderRadius": "8px", "marginBottom": "24px"},
         )
+
+    metric_card_css = html.Style(
+        """
+        .metric-card-button {
+            width: 100%;
+            border: none;
+            background: transparent;
+            padding: 0;
+            text-align: inherit;
+            cursor: pointer;
+        }
+        .metric-card-button:hover > div {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+            border-color: #90caf9;
+        }
+        .metric-card-button:focus-visible > div {
+            outline: 3px solid #90caf9;
+            outline-offset: 2px;
+        }
+        """
+    )
+
+    conversation_flags = _load_conversation_flags()
 
     # Data volume section
     data_summary = html.Div(
@@ -448,9 +758,10 @@ def _build_layout(report: dict[str, Any]) -> Any:
         style={"marginBottom": "24px"},
     )
 
-    # Conversations table with filter
+    # Conversations table with interactive filters
     conv_data = []
     for conv in report["conversations"]:
+        flags = conversation_flags.get(conv.conversation_id, {})
         conv_data.append({
             "topic": conv.topic,
             "ownership": conv.ownership,
@@ -459,23 +770,43 @@ def _build_layout(report: dict[str, Any]) -> Any:
             "latest_sender": conv.latest_sender,
             "last_activity": conv.last_activity.strftime("%Y-%m-%d %H:%M") if conv.last_activity else "",
             "action": "⚠️ Yes" if conv.action_required else "",
+            "conversation_id": conv.conversation_id,
+            "participants": ", ".join(conv.participants),
+            "has_unread": flags.get("has_unread", False),
+            "has_flagged": flags.get("has_flagged", False),
         })
 
     conversations_section = html.Div(
         [
             html.H2("💬 Conversations"),
-            dcc.Dropdown(
-                id="ownership-filter",
-                options=[
-                    {"label": "All", "value": "All"},
-                    {"label": "Awaiting My Action", "value": "Awaiting My Action"},
-                    {"label": "Waiting For Others", "value": "Waiting For Others"},
-                    {"label": "Information Only", "value": "Information Only"},
-                    {"label": "Unknown", "value": "Unknown"},
+            html.Div(
+                [
+                    html.Span(
+                        "Active Filter: All Conversations",
+                        id="active-filter-label",
+                        style={"fontWeight": "bold", "color": "#444"},
+                    ),
+                    html.Button(
+                        "Clear Filter",
+                        id="clear-filter-button",
+                        n_clicks=0,
+                        disabled=True,
+                        style={
+                            "padding": "10px 16px",
+                            "border": "1px solid #d0d7de",
+                            "borderRadius": "8px",
+                            "backgroundColor": "white",
+                            "cursor": "pointer",
+                        },
+                    ),
                 ],
-                value="All",
-                clearable=False,
-                style={"maxWidth": "300px", "marginBottom": "12px"},
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "center",
+                    "gap": "12px",
+                    "marginBottom": "12px",
+                },
             ),
             dash_table.DataTable(
                 id="conversations-table",
@@ -487,21 +818,45 @@ def _build_layout(report: dict[str, Any]) -> Any:
                     {"name": "Latest Sender", "id": "latest_sender"},
                     {"name": "Last Activity", "id": "last_activity"},
                     {"name": "Action?", "id": "action"},
+                    {"name": "Conversation ID", "id": "conversation_id"},
+                    {"name": "Participants", "id": "participants"},
+                    {"name": "Unread", "id": "has_unread"},
+                    {"name": "Flagged", "id": "has_flagged"},
                 ],
                 data=conv_data,
+                hidden_columns=["conversation_id", "participants", "has_unread", "has_flagged"],
                 page_size=20,
                 sort_action="native",
                 filter_action="native",
+                cell_selectable=True,
                 style_table={"overflowX": "auto"},
                 style_cell={"textAlign": "left", "padding": "8px", "maxWidth": "300px", "overflow": "hidden", "textOverflow": "ellipsis"},
                 style_header={"fontWeight": "bold", "backgroundColor": "#f5f5f5"},
+                style_data_conditional=[
+                    {
+                        "if": {"state": "active"},
+                        "backgroundColor": "#e3f2fd",
+                        "border": "1px solid #1976d2",
+                    }
+                ],
+                css=[{"selector": "tr:hover", "rule": "background-color: #f7fbff; cursor: pointer;"}],
             ),
             dcc.Store(id="conversations-store", data=conv_data),
+            dcc.Store(id="metric-filter-store", data={"kind": "all", "value": None, "label": "All Conversations"}),
+            dcc.Store(id="selected-entry-store"),
+            html.Div(
+                id="conversation-detail-panel",
+                children=html.Div(
+                    "Select a conversation row to see thread details and open the latest email in Outlook.",
+                    style={"padding": "16px", "color": "#666"},
+                ),
+            ),
         ]
     )
 
     return html.Div(
         [
+            metric_card_css,
             html.H1("📬 Outlook Intelligence Dashboard"),
             status_banner,
             data_summary,
@@ -517,18 +872,27 @@ def _build_layout(report: dict[str, Any]) -> Any:
 
 
 def _metric_card(title: str, value: Any, bg_color: str = "#FAFAFA") -> Any:
-    return html.Div(
-        [
-            html.P(title, style={"margin": "0 0 4px 0", "fontSize": "13px", "color": "#555"}),
-            html.P(str(value), style={"margin": "0", "fontSize": "32px", "fontWeight": "bold"}),
-        ],
-        style={
-            "border": "1px solid #e0e0e0",
-            "borderRadius": "8px",
-            "padding": "16px",
-            "backgroundColor": bg_color,
-            "textAlign": "center",
-        },
+    return html.Button(
+        html.Div(
+            [
+                html.P(title, style={"margin": "0 0 4px 0", "fontSize": "13px", "color": "#555"}),
+                html.P(str(value), style={"margin": "0", "fontSize": "32px", "fontWeight": "bold"}),
+            ],
+            style={
+                "border": "1px solid #e0e0e0",
+                "borderRadius": "8px",
+                "padding": "16px",
+                "backgroundColor": bg_color,
+                "textAlign": "center",
+                "transition": "transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease",
+                "boxShadow": "0 2px 4px rgba(0, 0, 0, 0.04)",
+            },
+        ),
+        id=_metric_card_id(title),
+        className="metric-card-button",
+        n_clicks=0,
+        title=f"Filter conversations by {title}",
+        style={"padding": "0", "background": "transparent"},
     )
 
 
