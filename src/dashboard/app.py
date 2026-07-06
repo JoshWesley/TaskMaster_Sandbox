@@ -2,13 +2,20 @@
 
 Connects to Outlook via COM on startup, syncs emails into SQLite,
 and displays live data about what has been pulled in.
+
+On first run: full sync with progress bar.
+On subsequent runs: loads cached data instantly, then incrementally syncs new emails only.
 """
 
 from __future__ import annotations
 
+import sqlite3
+import sys
+import time
 import traceback
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 try:
@@ -16,9 +23,6 @@ try:
 except ImportError:  # pragma: no cover
     Dash = None  # type: ignore[assignment]
     Input = Output = dash_table = dcc = html = None  # type: ignore[assignment]
-
-import sys
-from pathlib import Path
 
 # Ensure src is importable when running this file directly.
 _SRC_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -29,9 +33,136 @@ from src.conversations.engine import ConversationEngine
 from src.outlook.extractor import OutlookExtractor
 from src.storage.database import DatabaseManager
 
+DB_PATH = "database/dashboard.db"
 
-def _sync_outlook(limit_per_folder: int = 500) -> dict[str, Any]:
-    """Connect to Outlook, extract emails, build conversations, and return a status report."""
+
+def _print_progress(current: int, total: int, folder: str, start_time: float) -> None:
+    """Print a terminal progress bar."""
+    if total == 0:
+        return
+    pct = current / total
+    bar_len = 40
+    filled = int(bar_len * pct)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    elapsed = time.time() - start_time
+    rate = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / rate if rate > 0 else 0
+    sys.stdout.write(
+        f"\r  [{bar}] {current}/{total} ({pct:.0%}) | {folder} | {rate:.0f} emails/sec | ETA: {eta:.0f}s  "
+    )
+    sys.stdout.flush()
+
+
+def _has_cached_data(db: DatabaseManager) -> bool:
+    """Check if we have previously synced data in SQLite."""
+    try:
+        with db.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM emails").fetchone()
+            return row[0] > 0
+    except (sqlite3.OperationalError, Exception):
+        return False
+
+
+def _load_from_cache(db: DatabaseManager) -> dict[str, Any]:
+    """Load existing synced data from SQLite for instant startup."""
+    report: dict[str, Any] = {
+        "connected": True,
+        "error": None,
+        "folders_synced": [],
+        "total_emails": 0,
+        "total_conversations": 0,
+        "emails_by_folder": {},
+        "conversations": [],
+        "ownership_counts": Counter(),
+        "type_counts": Counter(),
+        "top_senders": Counter(),
+        "top_domains": Counter(),
+        "unread_count": 0,
+        "flagged_count": 0,
+        "sync_time": None,
+        "from_cache": True,
+    }
+
+    with db.connect() as conn:
+        # Total emails
+        report["total_emails"] = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+
+        # Emails by folder
+        rows = conn.execute("SELECT folder, COUNT(*) as cnt FROM emails GROUP BY folder").fetchall()
+        for row in rows:
+            report["emails_by_folder"][row[0]] = row[1]
+            report["folders_synced"].append(row[0])
+
+        # Unread / flagged
+        report["unread_count"] = conn.execute(
+            "SELECT COUNT(*) FROM emails WHERE read_status = 'Unread'"
+        ).fetchone()[0]
+        report["flagged_count"] = conn.execute(
+            "SELECT COUNT(*) FROM emails WHERE flag_status NOT IN ('0', '', 'None') AND flag_status IS NOT NULL"
+        ).fetchone()[0]
+
+        # Top senders
+        rows = conn.execute(
+            "SELECT sender_name, COUNT(*) as cnt FROM emails GROUP BY sender_name ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        for row in rows:
+            report["top_senders"][row[0]] = row[1]
+
+        # Top domains
+        rows = conn.execute(
+            "SELECT sender_domain, COUNT(*) as cnt FROM emails GROUP BY sender_domain ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        for row in rows:
+            report["top_domains"][row[0]] = row[1]
+
+        # Last sync time
+        row = conn.execute("SELECT MAX(last_synced_at) FROM sync_state").fetchone()
+        report["sync_time"] = row[0] if row and row[0] else "Unknown"
+
+        # Conversations from DB
+        conv_rows = conn.execute("SELECT * FROM conversations ORDER BY last_activity DESC").fetchall()
+        report["total_conversations"] = len(conv_rows)
+        for crow in conv_rows:
+            crow_dict = dict(crow)
+            report["ownership_counts"][crow_dict.get("ownership", "Unknown")] += 1
+            report["type_counts"][crow_dict.get("conversation_type", "Unknown")] += 1
+
+        # Build conversation objects for the table
+        engine = ConversationEngine()
+        email_rows = conn.execute("SELECT * FROM emails ORDER BY received_time DESC").fetchall()
+        email_dicts = [dict(r) for r in email_rows]
+        if email_dicts:
+            report["conversations"] = engine.build_conversations(email_dicts)
+
+    return report
+
+
+def _get_last_sync_time(db: DatabaseManager, folder_name: str) -> str | None:
+    """Get the last sync timestamp for a folder."""
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT last_synced_at FROM sync_state WHERE folder_name = ?", (folder_name,)
+            ).fetchone()
+            return row[0] if row else None
+    except (sqlite3.OperationalError, Exception):
+        return None
+
+
+def _sync_outlook(limit_per_folder: int = 500, force_full: bool = False) -> dict[str, Any]:
+    """Connect to Outlook, extract emails with progress bar, and return a status report.
+
+    Uses incremental sync on subsequent runs — only fetches emails newer than
+    the last sync time. Data is persisted to SQLite for fast future startups.
+    """
+
+    db = DatabaseManager(DB_PATH)
+    db.initialize()
+
+    # If we have cached data and not forcing full sync, load cache first then sync incrementally
+    has_cache = _has_cached_data(db)
+    if has_cache and not force_full:
+        print("  ⚡ Loading cached data from previous sync...")
 
     report: dict[str, Any] = {
         "connected": False,
@@ -48,53 +179,102 @@ def _sync_outlook(limit_per_folder: int = 500) -> dict[str, Any]:
         "unread_count": 0,
         "flagged_count": 0,
         "sync_time": None,
+        "from_cache": False,
+        "new_emails_synced": 0,
     }
 
     try:
         extractor = OutlookExtractor()
+        print("  🔌 Connecting to Outlook...")
         extractor.connect()
         report["connected"] = True
+        print("  ✅ Connected to Outlook")
 
-        # Extract from default folders (Inbox + Sent Items)
-        records = extractor.extract_folders(limit=limit_per_folder)
-        report["total_emails"] = len(records)
+        # Sync each folder with progress
+        all_records = []
+        folders = extractor.folder_names
+        for folder_name in folders:
+            last_sync = _get_last_sync_time(db, folder_name) if has_cache and not force_full else None
+
+            if last_sync:
+                print(f"\n  📂 {folder_name} (incremental since {last_sync})")
+            else:
+                print(f"\n  📂 {folder_name} (full sync, up to {limit_per_folder} emails)")
+
+            start_time = time.time()
+            count = 0
+            folder_records = []
+
+            for item in extractor.iter_folder_items(folder_name, limit=limit_per_folder):
+                record = extractor.extract_message(item, folder_name)
+
+                # Incremental: skip emails we've already synced
+                if last_sync and record.received_time:
+                    if record.received_time.isoformat() <= last_sync:
+                        # We've reached emails we already have — stop
+                        break
+
+                folder_records.append(record)
+                count += 1
+                _print_progress(count, limit_per_folder, folder_name, start_time)
+
+            # End of folder
+            elapsed = time.time() - start_time
+            print(f"\n  ✓ {folder_name}: {count} emails in {elapsed:.1f}s")
+
+            all_records.extend(folder_records)
+
+            # Persist records to SQLite
+            for record in folder_records:
+                db.upsert_email(record.to_dict())
+
+            # Update sync state
+            db.update_sync_state(
+                folder_name,
+                last_synced_at=datetime.now().isoformat(),
+                last_entry_id=folder_records[0].entry_id if folder_records else "",
+            )
+
+        report["new_emails_synced"] = len(all_records)
         report["sync_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Persist to SQLite
-        db = DatabaseManager()
-        db.initialize()
-        for record in records:
-            db.upsert_email(record.to_dict())
+        # Now build report from ALL data in SQLite (cached + new)
+        print("\n  📊 Building conversation intelligence...")
+        cached_report = _load_from_cache(db)
+        report["total_emails"] = cached_report["total_emails"]
+        report["total_conversations"] = cached_report["total_conversations"]
+        report["emails_by_folder"] = cached_report["emails_by_folder"]
+        report["folders_synced"] = cached_report["folders_synced"]
+        report["ownership_counts"] = cached_report["ownership_counts"]
+        report["type_counts"] = cached_report["type_counts"]
+        report["top_senders"] = cached_report["top_senders"]
+        report["top_domains"] = cached_report["top_domains"]
+        report["unread_count"] = cached_report["unread_count"]
+        report["flagged_count"] = cached_report["flagged_count"]
+        report["conversations"] = cached_report["conversations"]
 
-        # Folder breakdown
-        for record in records:
-            folder = record.folder
-            report["emails_by_folder"][folder] = report["emails_by_folder"].get(folder, 0) + 1
-            if folder not in report["folders_synced"]:
-                report["folders_synced"].append(folder)
-            report["top_senders"][record.sender_name] += 1
-            report["top_domains"][record.sender_domain] += 1
-            if record.read_status == "Unread":
-                report["unread_count"] += 1
-            if record.flag_status and record.flag_status not in ("0", "", "None"):
-                report["flagged_count"] += 1
-
-        # Build conversations
+        # Persist conversations
         engine = ConversationEngine()
-        email_dicts = [r.to_dict() for r in records]
+        with db.connect() as conn:
+            email_rows = conn.execute("SELECT * FROM emails ORDER BY received_time DESC").fetchall()
+            email_dicts = [dict(r) for r in email_rows]
         conversations = engine.build_conversations(email_dicts)
-        report["total_conversations"] = len(conversations)
-        report["conversations"] = conversations
-
         for conv in conversations:
-            report["ownership_counts"][conv.ownership] += 1
-            report["type_counts"][conv.conversation_type] += 1
-
-            # Persist conversation
             db.upsert_conversation(conv.to_dict())
+
+        print(f"  ✅ Sync complete: {report['new_emails_synced']} new emails, {report['total_emails']} total in database")
 
     except Exception as e:
         report["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        print(f"\n  ❌ Error: {type(e).__name__}: {e}")
+
+        # If sync failed but we have cached data, use it
+        if has_cache:
+            print("  ⚡ Falling back to cached data...")
+            cached = _load_from_cache(db)
+            cached["error"] = report["error"]
+            cached["connected"] = False
+            return cached
 
     return report
 
@@ -105,7 +285,7 @@ def create_app(sync_limit: int = 500) -> "Dash":
     if Dash is None:
         raise RuntimeError("Dash is not installed. Install requirements.txt to run the dashboard UI.")
 
-    # Sync data from Outlook
+    # Sync data from Outlook (incremental if cache exists)
     report = _sync_outlook(limit_per_folder=sync_limit)
 
     app = Dash(__name__)
@@ -130,10 +310,15 @@ def _build_layout(report: dict[str, Any]) -> Any:
 
     # Connection status banner
     if report["connected"]:
+        sync_detail = f"Last sync: {report['sync_time']}"
+        if report.get("new_emails_synced", 0) > 0:
+            sync_detail += f"  •  {report['new_emails_synced']} new emails synced"
+        elif report.get("from_cache"):
+            sync_detail += "  •  Loaded from cache (instant startup)"
         status_banner = html.Div(
             [
                 html.Span("✅ Connected to Outlook", style={"fontWeight": "bold", "color": "#2e7d32"}),
-                html.Span(f"  •  Last sync: {report['sync_time']}", style={"marginLeft": "16px", "color": "#555"}),
+                html.Span(f"  •  {sync_detail}", style={"marginLeft": "16px", "color": "#555"}),
             ],
             style={"padding": "12px 16px", "backgroundColor": "#e8f5e9", "borderRadius": "8px", "marginBottom": "24px"},
         )
@@ -329,7 +514,12 @@ def _metric_card(title: str, value: Any, bg_color: str = "#FAFAFA") -> Any:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    print("Connecting to Outlook and syncing data...")
+    print("\n" + "=" * 60)
+    print("  📬 Outlook Intelligence Dashboard")
+    print("=" * 60)
+    print("\n  Syncing with Outlook...\n")
     app = create_app(sync_limit=500)
-    print("Dashboard ready. Opening at http://127.0.0.1:8050")
+    print("\n" + "=" * 60)
+    print("  🚀 Dashboard ready at http://127.0.0.1:8050")
+    print("=" * 60 + "\n")
     app.run(debug=True)
