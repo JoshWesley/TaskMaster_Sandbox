@@ -195,70 +195,65 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
         all_records = []
         folders = extractor.folder_names
         for folder_name in folders:
-            last_sync = _get_last_sync_time(db, folder_name) if has_cache and not force_full else None
 
-            # Check if previous sync was incomplete (e.g. was limited)
-            # Compare DB count vs actual Outlook folder count
-            needs_full_sync = False
-            outlook_count = 0
-            try:
-                folder_obj = extractor._resolve_folder(extractor.connect(), folder_name)
-                # Items.Count may underreport with Cached Exchange Mode
-                # but it's good enough to detect large gaps
-                outlook_count = folder_obj.Items.Count
-            except Exception:
-                pass
+            # Check if previous sync was incomplete
+            # We use entry_id dedup instead of timestamp-based incremental
+            # to handle resuming a partial sync of older emails
+            existing_entry_ids: set[str] = set()
+            with db.connect() as conn:
+                rows = conn.execute(
+                    "SELECT entry_id FROM emails WHERE folder = ?", (folder_name,)
+                ).fetchall()
+                existing_entry_ids = {row[0] for row in rows}
 
-            if last_sync and outlook_count > 0:
-                with db.connect() as conn:
-                    db_count = conn.execute(
-                        "SELECT COUNT(*) FROM emails WHERE folder = ?", (folder_name,)
-                    ).fetchone()[0]
-                # If DB has significantly fewer emails than Outlook, do a full sync
-                if db_count < outlook_count * 0.9:
-                    needs_full_sync = True
-                    last_sync = None  # Force full sync for this folder
-
-            if last_sync:
-                print(f"\n  📂 {folder_name} (incremental since {last_sync})")
-            elif needs_full_sync:
-                print(f"\n  📂 {folder_name} (full sync — previous sync was incomplete, {outlook_count} emails in folder)")
+            already_synced = len(existing_entry_ids)
+            if already_synced > 0:
+                print(f"\n  📂 {folder_name} ({already_synced:,} already in database, syncing remaining...)")
             else:
-                label = f"up to {limit_per_folder}" if limit_per_folder else "all emails"
+                label = f"up to {limit_per_folder:,}" if limit_per_folder else "all emails"
                 print(f"\n  📂 {folder_name} (full sync, {label})")
 
             start_time = time.time()
             count = 0
+            skipped = 0
             folder_records = []
 
             for item in extractor.iter_folder_items(folder_name, limit=limit_per_folder):
                 record = extractor.extract_message(item, folder_name)
 
-                # Incremental: skip emails we've already synced
-                if last_sync and record.received_time:
-                    if record.received_time.isoformat() <= last_sync:
-                        # We've reached emails we already have — stop
+                # Skip emails we already have in the database
+                if record.entry_id in existing_entry_ids:
+                    skipped += 1
+                    # Once we hit a run of 50 consecutive already-synced emails, stop
+                    # (we've reached the point where previous sync left off)
+                    if already_synced > 0 and skipped > already_synced:
                         break
+                    continue
 
+                skipped = 0  # Reset consecutive skip counter
                 folder_records.append(record)
                 count += 1
                 elapsed = time.time() - start_time
                 rate = count / elapsed if elapsed > 0 else 0
-                eta_str = ""
-                if limit_per_folder and limit_per_folder > count:
-                    eta = (limit_per_folder - count) / rate if rate > 0 else 0
-                    eta_str = f" | ETA: {eta:.0f}s"
-                sys.stdout.write(f"\r  ⏳ {count:,} emails synced | {folder_name} | {rate:.0f}/sec{eta_str}     ")
+                sys.stdout.write(
+                    f"\r  ⏳ {count:,} new | {already_synced + count:,} total | {folder_name} | {rate:.0f}/sec     "
+                )
                 sys.stdout.flush()
+
+                # Persist in batches of 100 to avoid losing progress on interrupt
+                if count % 100 == 0:
+                    for rec in folder_records[-100:]:
+                        db.upsert_email(rec.to_dict())
 
             # End of folder
             elapsed = time.time() - start_time
-            print(f"\n  ✓ {folder_name}: {count} emails in {elapsed:.1f}s")
+            print(f"\n  ✓ {folder_name}: {count:,} new emails in {elapsed:.1f}s ({already_synced + count:,} total)")
 
             all_records.extend(folder_records)
 
-            # Persist records to SQLite
-            for record in folder_records:
+            # Persist any remaining records not yet saved
+            remaining = folder_records[-(count % 100):] if count % 100 != 0 else []
+            for record in remaining:
                 db.upsert_email(record.to_dict())
 
             # Update sync state
