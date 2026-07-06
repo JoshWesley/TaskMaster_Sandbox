@@ -438,17 +438,146 @@ def _open_email_in_outlook(entry_id: str) -> tuple[bool, str]:
         return False, f"Could not open Outlook email: {exc}"
 
 
+# Global sync status tracking
+_sync_status = {"state": "idle", "error": None}  # state: idle, running, complete, error
+
+
+def _get_sync_status() -> str:
+    """Return current sync state: idle, running, complete, error."""
+    return _sync_status["state"]
+
+
+def _background_sync(limit_per_folder: int | None = None) -> None:
+    """Run Outlook sync in a background thread. Updates SQLite as it goes."""
+    import pythoncom
+
+    _sync_status["state"] = "running"
+    try:
+        # Required for COM in a background thread
+        pythoncom.CoInitialize()
+        _sync_outlook(limit_per_folder=limit_per_folder)
+        _sync_status["state"] = "complete"
+    except Exception as e:
+        _sync_status["state"] = "error"
+        _sync_status["error"] = str(e)
+        print(f"\n  ❌ Background sync error: {e}")
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def _build_conv_data(conversations: list) -> list[dict[str, Any]]:
+    """Convert conversation objects to table-friendly dicts."""
+    conv_data = []
+    for conv in conversations:
+        if hasattr(conv, "topic"):
+            conv_data.append({
+                "topic": conv.topic,
+                "ownership": conv.ownership,
+                "type": conv.conversation_type,
+                "messages": conv.message_count,
+                "latest_sender": conv.latest_sender,
+                "last_activity": conv.last_activity.strftime("%Y-%m-%d %H:%M") if conv.last_activity else "",
+                "action": "⚠️ Yes" if conv.action_required else "",
+                "conversation_id": conv.conversation_id,
+            })
+        elif isinstance(conv, dict):
+            conv_data.append({
+                "topic": conv.get("topic", ""),
+                "ownership": conv.get("ownership", ""),
+                "type": conv.get("conversation_type", ""),
+                "messages": conv.get("message_count", 0),
+                "latest_sender": conv.get("latest_sender", ""),
+                "last_activity": conv.get("last_activity", ""),
+                "action": "⚠️ Yes" if conv.get("action_required") else "",
+                "conversation_id": conv.get("conversation_id", ""),
+            })
+    return conv_data
+
+
 def create_app(sync_limit: int | None = None) -> "Dash":
-    """Create the Dash app with live Outlook data."""
+    """Create the Dash app with live Outlook data.
+
+    Loads cached data instantly, then syncs new emails in a background thread.
+    The dashboard auto-refreshes as sync progresses.
+    """
 
     if Dash is None:
         raise RuntimeError("Dash is not installed. Install requirements.txt to run the dashboard UI.")
 
-    # Sync data from Outlook (incremental if cache exists)
-    report = _sync_outlook(limit_per_folder=sync_limit)
+    db = DatabaseManager(DB_PATH)
+    db.initialize()
+
+    # Load cached data immediately for instant startup
+    if _has_cached_data(db):
+        print("  ⚡ Loading cached data for instant startup...")
+        report = _load_from_cache(db)
+        report["connected"] = True
+    else:
+        report = {
+            "connected": False,
+            "error": None,
+            "folders_synced": [],
+            "total_emails": 0,
+            "total_conversations": 0,
+            "emails_by_folder": {},
+            "conversations": [],
+            "ownership_counts": Counter(),
+            "type_counts": Counter(),
+            "top_senders": Counter(),
+            "top_domains": Counter(),
+            "unread_count": 0,
+            "flagged_count": 0,
+            "sync_time": None,
+            "from_cache": False,
+            "new_emails_synced": 0,
+        }
 
     app = Dash(__name__, suppress_callback_exceptions=True)
     app.layout = _build_layout(report)
+
+    # Start background sync thread
+    import threading
+    sync_thread = threading.Thread(
+        target=_background_sync,
+        args=(sync_limit,),
+        daemon=True,
+    )
+    sync_thread.start()
+
+    # Add interval-driven refresh callback to update dashboard during sync
+    @app.callback(
+        Output("conversations-store", "data"),
+        Output("sync-status-banner", "children"),
+        Input("sync-refresh-interval", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def refresh_from_db(n_intervals: int) -> tuple[list[dict[str, Any]], Any]:
+        """Periodically reload data from SQLite as background sync adds emails."""
+        fresh_report = _load_from_cache(db)
+        conv_data = _build_conv_data(fresh_report.get("conversations", []))
+
+        # Build status message
+        total = fresh_report["total_emails"]
+        sync_state = _get_sync_status()
+        if sync_state == "running":
+            banner = html.Span(
+                [
+                    html.Span("🔄 Syncing in background... ", style={"fontWeight": "bold"}),
+                    html.Span(f"{total:,} emails in database", style={"color": "#555"}),
+                ],
+            )
+        elif sync_state == "complete":
+            banner = html.Span(
+                f"✅ Sync complete — {total:,} emails in database",
+                style={"color": "#2e7d32", "fontWeight": "bold"},
+            )
+        else:
+            banner = html.Span(
+                f"❌ Sync error — {total:,} emails in database (see terminal for details)",
+                style={"color": "#c62828", "fontWeight": "bold"},
+            )
+
+        return conv_data, banner
 
     @app.callback(
         Output("conversations-table", "data"),
@@ -844,6 +973,12 @@ def _build_layout(report: dict[str, Any]) -> Any:
     return html.Div(
         [
             html.H1("📬 Outlook Intelligence Dashboard"),
+            # Sync status banner (updated by interval callback)
+            html.Div(id="sync-status-banner", children=[
+                html.Span("🔄 Background sync starting...", style={"fontWeight": "bold", "color": "#1565c0"})
+            ], style={"padding": "8px 16px", "backgroundColor": "#e3f2fd", "borderRadius": "8px", "marginBottom": "12px"}),
+            # Auto-refresh interval (every 10 seconds)
+            dcc.Interval(id="sync-refresh-interval", interval=10_000, n_intervals=0),
             status_banner,
             data_summary,
             folder_section,
@@ -886,9 +1021,10 @@ if __name__ == "__main__":  # pragma: no cover
     print("\n" + "=" * 60)
     print("  📬 Outlook Intelligence Dashboard")
     print("=" * 60)
-    print("\n  Syncing with Outlook...\n")
+    print("\n  Starting dashboard (sync runs in background)...\n")
     app = create_app()
     print("\n" + "=" * 60)
     print("  🚀 Dashboard ready at http://127.0.0.1:8050")
+    print("  🔄 Outlook sync running in background...")
     print("=" * 60 + "\n")
-    app.run(debug=True)
+    app.run(debug=False)  # debug=False required for background threads
