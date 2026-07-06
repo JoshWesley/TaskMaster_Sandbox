@@ -1,0 +1,7 @@
+pywin32
+pandas
+numpy
+rapidfuzz
+scikit-learn
+python-dateutil
+dash

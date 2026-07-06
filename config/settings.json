@@ -1,0 +1,15 @@
+{
+  "internal_domain": "@motionapplied.com",
+  "database_path": "database/dashboard.db",
+  "sync": {
+    "enabled": true,
+    "mode": "incremental",
+    "batch_size": 200,
+    "background_refresh_minutes": 15,
+    "default_folders": [
+      "Inbox",
+      "Sent Items"
+    ],
+    "custom_folders": []
+  }
+}
