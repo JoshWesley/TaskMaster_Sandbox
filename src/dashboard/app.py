@@ -637,28 +637,6 @@ def _build_layout(report: dict[str, Any]) -> Any:
             style={"padding": "12px 16px", "backgroundColor": "#ffebee", "borderRadius": "8px", "marginBottom": "24px"},
         )
 
-    metric_card_css = html.Style(
-        """
-        .metric-card-button {
-            width: 100%;
-            border: none;
-            background: transparent;
-            padding: 0;
-            text-align: inherit;
-            cursor: pointer;
-        }
-        .metric-card-button:hover > div {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
-            border-color: #90caf9;
-        }
-        .metric-card-button:focus-visible > div {
-            outline: 3px solid #90caf9;
-            outline-offset: 2px;
-        }
-        """
-    )
-
     conversation_flags = _load_conversation_flags()
 
     # Data volume section
@@ -856,7 +834,6 @@ def _build_layout(report: dict[str, Any]) -> Any:
 
     return html.Div(
         [
-            metric_card_css,
             html.H1("📬 Outlook Intelligence Dashboard"),
             status_banner,
             data_summary,

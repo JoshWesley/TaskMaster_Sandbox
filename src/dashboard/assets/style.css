@@ -1,0 +1,17 @@
+.metric-card-button {
+    width: 100%;
+    border: none;
+    background: transparent;
+    padding: 0;
+    text-align: inherit;
+    cursor: pointer;
+}
+.metric-card-button:hover > div {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 18px rgba(0, 0, 0, 0.12);
+    border-color: #90caf9;
+}
+.metric-card-button:focus-visible > div {
+    outline: 3px solid #90caf9;
+    outline-offset: 2px;
+}
