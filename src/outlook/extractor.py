@@ -84,6 +84,7 @@ class OutlookExtractor:
         """Yield raw Outlook items from a folder in descending received order.
 
         Uses GetFirst/GetNext pattern for reliable iteration over large folders.
+        Yields any item with a Subject (mail, meeting requests, etc).
         """
 
         namespace = self.connect()
@@ -93,7 +94,8 @@ class OutlookExtractor:
         count = 0
         item = items.GetFirst()
         while item is not None:
-            if getattr(item, "Class", None) == 43:
+            # Accept any item that has a Subject (mail, meeting requests, etc.)
+            if hasattr(item, "Subject"):
                 yield item
                 count += 1
                 if limit is not None and count >= limit:

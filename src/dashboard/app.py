@@ -200,11 +200,14 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
             # Check if previous sync was incomplete (e.g. was limited)
             # Compare DB count vs actual Outlook folder count
             needs_full_sync = False
+            outlook_count = 0
             try:
                 folder_obj = extractor._resolve_folder(extractor.connect(), folder_name)
+                # Items.Count may underreport with Cached Exchange Mode
+                # but it's good enough to detect large gaps
                 outlook_count = folder_obj.Items.Count
             except Exception:
-                outlook_count = 0
+                pass
 
             if last_sync and outlook_count > 0:
                 with db.connect() as conn:
@@ -228,9 +231,6 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
             count = 0
             folder_records = []
 
-            # Get total count for progress bar
-            folder_total = limit_per_folder or outlook_count
-
             for item in extractor.iter_folder_items(folder_name, limit=limit_per_folder):
                 record = extractor.extract_message(item, folder_name)
 
@@ -242,13 +242,13 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
 
                 folder_records.append(record)
                 count += 1
-                if folder_total and folder_total > 0:
-                    _print_progress(count, folder_total, folder_name, start_time)
+                elapsed = time.time() - start_time
+                rate = count / elapsed if elapsed > 0 else 0
+                if outlook_count and outlook_count > count:
+                    # Show progress bar when we have a reliable total
+                    _print_progress(count, outlook_count, folder_name, start_time)
                 else:
-                    # Unknown total — just show count and rate
-                    elapsed = time.time() - start_time
-                    rate = count / elapsed if elapsed > 0 else 0
-                    sys.stdout.write(f"\r  ⏳ {count} emails synced | {folder_name} | {rate:.0f}/sec  ")
+                    sys.stdout.write(f"\r  ⏳ {count:,} emails synced | {folder_name} | {rate:.0f}/sec  ")
                     sys.stdout.flush()
 
             # End of folder
