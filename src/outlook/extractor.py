@@ -81,20 +81,48 @@ class OutlookExtractor:
         return records
 
     def iter_folder_items(self, folder_name: str, limit: int | None = None) -> Iterator[object]:
-        """Yield raw Outlook items from a folder in descending received order."""
+        """Yield raw Outlook items from a folder in descending received order.
+
+        Uses GetFirst/GetNext pattern for reliable iteration over large folders.
+        """
 
         namespace = self.connect()
-        folder = namespace.Folders.Item(1).Folders[folder_name]
+        folder = self._resolve_folder(namespace, folder_name)
         items = folder.Items
         items.Sort("[ReceivedTime]", True)
         count = 0
-        for item in items:
-            if getattr(item, "Class", None) != 43:
+        item = items.GetFirst()
+        while item is not None:
+            if getattr(item, "Class", None) == 43:
+                yield item
+                count += 1
+                if limit is not None and count >= limit:
+                    break
+            item = items.GetNext()
+
+    def _resolve_folder(self, namespace: object, folder_name: str) -> object:
+        """Resolve a folder by name, searching all top-level stores."""
+
+        # Try default store first
+        try:
+            default_inbox = namespace.GetDefaultFolder(6)  # olFolderInbox = 6
+            if folder_name.lower() == "inbox":
+                return default_inbox
+            # Check sibling folders (Sent Items, etc.)
+            parent = default_inbox.Parent
+            return parent.Folders[folder_name]
+        except Exception:
+            pass
+
+        # Fallback: search all top-level folders
+        for i in range(1, namespace.Folders.Count + 1):
+            store = namespace.Folders.Item(i)
+            try:
+                return store.Folders[folder_name]
+            except Exception:
                 continue
-            yield item
-            count += 1
-            if limit is not None and count >= limit:
-                break
+
+        raise RuntimeError(f"Could not find Outlook folder: {folder_name}")
 
     def extract_message(self, item: object, folder_name: str) -> EmailRecord:
         """Normalize a single Outlook MailItem into an EmailRecord."""

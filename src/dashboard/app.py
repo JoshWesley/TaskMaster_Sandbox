@@ -201,8 +201,7 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
             # Compare DB count vs actual Outlook folder count
             needs_full_sync = False
             try:
-                namespace = extractor.connect()
-                folder_obj = namespace.Folders.Item(1).Folders[folder_name]
+                folder_obj = extractor._resolve_folder(extractor.connect(), folder_name)
                 outlook_count = folder_obj.Items.Count
             except Exception:
                 outlook_count = 0
