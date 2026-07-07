@@ -119,20 +119,17 @@ def _load_from_cache(db: DatabaseManager) -> dict[str, Any]:
         row = conn.execute("SELECT MAX(last_synced_at) FROM sync_state").fetchone()
         report["sync_time"] = row[0] if row and row[0] else "Unknown"
 
-        # Conversations from DB
-        conv_rows = conn.execute("SELECT * FROM conversations ORDER BY last_activity DESC").fetchall()
-        report["total_conversations"] = len(conv_rows)
-        for crow in conv_rows:
-            crow_dict = dict(crow)
-            report["ownership_counts"][crow_dict.get("ownership", "Unknown")] += 1
-            report["type_counts"][crow_dict.get("conversation_type", "Unknown")] += 1
-
-        # Build conversation objects for the table
+        # Build conversations fresh from all emails (not from stale conversations table)
         engine = ConversationEngine()
         email_rows = conn.execute("SELECT * FROM emails ORDER BY received_time DESC").fetchall()
         email_dicts = [dict(r) for r in email_rows]
         if email_dicts:
-            report["conversations"] = engine.build_conversations(email_dicts)
+            conversations = engine.build_conversations(email_dicts)
+            report["conversations"] = conversations
+            report["total_conversations"] = len(conversations)
+            for conv in conversations:
+                report["ownership_counts"][conv.ownership] += 1
+                report["type_counts"][conv.conversation_type] += 1
 
     return report
 
@@ -191,9 +188,12 @@ def _sync_outlook(limit_per_folder: int | None = None, force_full: bool = False)
         report["connected"] = True
         print("  ✅ Connected to Outlook")
 
+        # Discover all folders including Inbox subfolders
+        folders = extractor.discover_folders(include_subfolders=True)
+        print(f"  📁 Found {len(folders)} folders: {', '.join(folders)}")
+
         # Sync each folder with progress
         all_records = []
-        folders = extractor.folder_names
         for folder_name in folders:
 
             # Check if previous sync was incomplete

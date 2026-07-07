@@ -103,28 +103,68 @@ class OutlookExtractor:
             item = items.GetNext()
 
     def _resolve_folder(self, namespace: object, folder_name: str) -> object:
-        """Resolve a folder by name, searching all top-level stores."""
+        """Resolve a folder by name, supporting subfolder paths like 'Inbox/F1Support'."""
 
-        # Try default store first
+        # Handle subfolder paths (e.g. "Inbox/F1Support")
+        parts = folder_name.replace("\\", "/").split("/")
+
+        # Resolve the root folder first
+        root_name = parts[0]
         try:
             default_inbox = namespace.GetDefaultFolder(6)  # olFolderInbox = 6
-            if folder_name.lower() == "inbox":
-                return default_inbox
-            # Check sibling folders (Sent Items, etc.)
-            parent = default_inbox.Parent
-            return parent.Folders[folder_name]
+            if root_name.lower() == "inbox":
+                folder = default_inbox
+            else:
+                parent = default_inbox.Parent
+                folder = parent.Folders[root_name]
+        except Exception:
+            folder = None
+            for i in range(1, namespace.Folders.Count + 1):
+                store = namespace.Folders.Item(i)
+                try:
+                    folder = store.Folders[root_name]
+                    break
+                except Exception:
+                    continue
+
+        if folder is None:
+            raise RuntimeError(f"Could not find Outlook folder: {root_name}")
+
+        # Navigate into subfolders
+        for subfolder_name in parts[1:]:
+            try:
+                folder = folder.Folders[subfolder_name]
+            except Exception:
+                raise RuntimeError(f"Could not find subfolder: {subfolder_name} under {folder_name}")
+
+        return folder
+
+    def discover_folders(self, include_subfolders: bool = True) -> list[str]:
+        """Discover all available folders including Inbox subfolders."""
+
+        namespace = self.connect()
+        folders = []
+
+        try:
+            default_inbox = namespace.GetDefaultFolder(6)
+            folders.append("Inbox")
+
+            if include_subfolders:
+                for i in range(1, default_inbox.Folders.Count + 1):
+                    subfolder = default_inbox.Folders.Item(i)
+                    folders.append(f"Inbox/{subfolder.Name}")
         except Exception:
             pass
 
-        # Fallback: search all top-level folders
-        for i in range(1, namespace.Folders.Count + 1):
-            store = namespace.Folders.Item(i)
-            try:
-                return store.Folders[folder_name]
-            except Exception:
-                continue
+        # Add Sent Items
+        try:
+            parent = namespace.GetDefaultFolder(6).Parent
+            parent.Folders["Sent Items"]
+            folders.append("Sent Items")
+        except Exception:
+            pass
 
-        raise RuntimeError(f"Could not find Outlook folder: {folder_name}")
+        return folders
 
     def extract_message(self, item: object, folder_name: str) -> EmailRecord:
         """Normalize a single Outlook MailItem into an EmailRecord."""
