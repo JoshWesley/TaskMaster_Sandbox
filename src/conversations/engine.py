@@ -207,10 +207,12 @@ class ConversationEngine:
         ]
         for value in candidates:
             if isinstance(value, datetime):
-                return value
+                # Strip timezone to avoid naive vs aware comparison errors
+                return value.replace(tzinfo=None)
             if isinstance(value, str) and value:
                 try:
-                    return datetime.fromisoformat(value)
+                    parsed = datetime.fromisoformat(value)
+                    return parsed.replace(tzinfo=None)
                 except ValueError:
                     continue
         return datetime.min
